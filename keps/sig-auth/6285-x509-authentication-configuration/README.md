@@ -12,6 +12,7 @@
     - [Advertising accepted X.509 issuers](#advertising-accepted-x509-issuers)
     - [Verifying presented client certificates](#verifying-presented-client-certificates)
     - [Publishing to extension-apiserver-authentication ConfigMap](#publishing-to-extension-apiserver-authentication-configmap)
+      - [Publishing conditional CAs as ClusterTrustBundles](#publishing-conditional-cas-as-clustertrustbundles)
   - [User Stories (Optional)](#user-stories-optional)
     - [Story 1 (Optional)](#story-1-optional)
     - [Story 2 (Optional)](#story-2-optional)
@@ -195,12 +196,98 @@ However, for authenticators with `userValidationRules` specified, it is unsafe t
 Therefore, we will do the following:
 1. Require any unconditional (no `userValidationRules`) authorities be placed in the first authenticator in the `x509` list.
 2. Publish any unconditional authenticator bundle into the `client-ca-file` key, as before.
-3. Serialize the remaining conditional `x509` authenticators as `v1.X509Authenticator` objects into `authentication-config-x509-<index>` keys
-   (with any `certificateAuthorityFile` fields read and converted to `certificateAuthority` fields),
-   teach `DelegatingAuthenticationOptions` / `DelegatingAuthenticatorConfig` to consume conditional x509 authenticators from these keys,
-   strictly decoding the contents, attempting to construct X509 authenticators, and unioning the resulting authenticators.
+3. Publish the CAs of each remaining conditional `x509` authenticator (with any `certificateAuthorityFile` read) as a `ClusterTrustBundle`,
+   as described in [Publishing conditional CAs as ClusterTrustBundles](#publishing-conditional-cas-as-clustertrustbundles),
+   and serialize the authenticator, with a reference to that `ClusterTrustBundle` in place of its CAs, into an `authentication-config-x509-<index>` key.
+   Teach `DelegatingAuthenticationOptions` / `DelegatingAuthenticatorConfig` to consume conditional x509 authenticators from these keys,
+   strictly decoding the contents, resolving and verifying the referenced `ClusterTrustBundle`, attempting to construct X509 authenticators, and unioning the resulting authenticators.
    If *some* of the X.509 authenticators can be successfully constructed, those can be used and the ones which failed decoding / construction discarded,
    along with any subsequent ones.
+
+The `authentication-config-x509-*` keys do not hold `v1.X509Authenticator` objects, since those would need a field referencing a `ClusterTrustBundle`,
+and kube-apiserver should not read the CAs it authenticates clients with from objects in its own storage.
+Instead, a separate type for the published form is defined in `k8s.io/apiserver`, holding the authenticator name,
+the name of the `ClusterTrustBundle` with its CAs, and its `userValidationRules`. For example:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  namespace: kube-system
+  name: extension-apiserver-authentication
+data:
+  client-ca-file: |
+    <PEM-encoded CA certificates of the unconditional authenticator>
+  authentication-config-x509-<index>: |
+    {"name":"domain1.example.com",
+     "certificateAuthorityClusterTrustBundleName":"kubernetes.io:kube-apiserver-conditional-client:<hash>",
+     "userValidationRules":[{"expression":"!user.username.startsWith('system:')","message":"username cannot contain reserved system: prefix"}]}
+  ...
+```
+
+The [cluster authentication trust controller](https://github.com/kubernetes/kubernetes/blob/bfc85351d3a3aaaf77709c09b40b600c244a505a/pkg/controlplane/controller/clusterauthenticationtrust/cluster_authentication_trust_controller.go)
+which maintains the ConfigMap rebuilds the whole `data` of the ConfigMap on every sync (`syncConfigMap`, `getConfigMapDataFor`).
+The CAs of `client-ca-file` are merged with the CAs already in the ConfigMap (`combineCertLists`), but the `authentication-config-x509-*` keys are not:
+* The conditional authenticators are not merged with the ones from other kube-apiservers (the last writer wins),
+  because user validation rules, such as revocations, must not be accumulated or combined with those of another configuration.
+* A kube-apiserver with the feature enabled replaces all `authentication-config-x509-*` keys with the ones derived from its own configuration.
+  Keys for indexes which it does not have are removed, and if it has no conditional authenticators, all of these keys are removed.
+* A kube-apiserver with the feature disabled leaves keys with this prefix, and the `ClusterTrustBundle` objects they reference, as they are.
+* The `client-ca-file` key is otherwise only ever added to (expired certificates aside).
+  To keep a CA from being trusted without rules after it is moved from the first authenticator to a conditional one, or gets a rule added,
+  the controller removes from the `client-ca-file` content every CA which is part of one of its conditional authenticators and not of its unconditional ones.
+  Consumers therefore need no logic for this, and consumers which do not support conditional authenticators stop trusting such a CA as well.
+* The `authentication-config-x509-*` keys only hold names, references and rules, so they add little to the size of the ConfigMap,
+  and the existing handling of a ConfigMap update rejected as too large (deleting the ConfigMap so that it is recreated) is unchanged.
+
+##### Publishing conditional CAs as ClusterTrustBundles
+
+The CAs of conditional authenticators are not embedded in the ConfigMap, but published as `ClusterTrustBundle` objects which the `authentication-config-x509-*` keys reference.
+This keeps the bulkiest content out of the shared ConfigMap, and makes use of the validation of `ClusterTrustBundle` objects.
+
+The bundles must only be used through a reference from an `authentication-config-x509-*` key, together with the `userValidationRules` of that key.
+To keep them from being used for anything else, and from being modified:
+* They use the dedicated signer name `kubernetes.io/kube-apiserver-conditional-client`, which is reserved for this purpose
+  and documented as not being usable to verify client certificates on its own.
+  They do not use `kubernetes.io/kube-apiserver-client`, since consumers selecting bundles by that signer name could trust them without the rules.
+* Creating or updating a `ClusterTrustBundle` with a signer name requires the `attest` verb on the signer, and signer names with the `kubernetes.io` prefix are reserved,
+  so only kube-apiserver (and cluster administrators) can create or update them, comparable to the ConfigMap in the `kube-system` namespace.
+* A `ClusterTrustBundle` named `kubernetes.io:kube-apiserver-conditional-client:<suffix>` must have this signer name (enforced by validation),
+  so a reference by name also pins the signer.
+
+The bundles are immutable and named after their content, in the same way as the bundles of the ClusterTrustBundle publisher in kube-controller-manager:
+`kubernetes.io:kube-apiserver-conditional-client:<hash>`, where `<hash>` is the hex-encoded first 12 bytes of the SHA-256 digest of `spec.trustBundle`.
+kube-apiserver writes `spec.trustBundle` as the PEM encoding of the sorted and deduplicated certificates, so the same CAs always result in the same name.
+* When the CAs of an authenticator change, a new bundle is created and the reference in the ConfigMap is switched to it,
+  so consumers do not combine the CAs of one configuration with the rules of another.
+* kube-apiservers with different configurations do not overwrite each other's bundles; only the ConfigMap keys change, as described above.
+* Consumers detect modified content by computing the hash of `spec.trustBundle` and comparing it to the name.
+* Authenticators with the same CAs share a bundle.
+
+On every sync, a kube-apiserver with the feature enabled:
+1. Creates the bundles for its conditional authenticators which do not exist yet.
+   An existing bundle whose content does not match its name is replaced.
+2. Updates the ConfigMap as described above.
+3. Deletes bundles with this signer name which are neither referenced by the ConfigMap nor needed for its own configuration,
+   after getting the ConfigMap from the API server, rather than from its cache, to confirm that they are not referenced.
+   This is similar to the [ClusterTrustBundle publisher](https://github.com/kubernetes/kubernetes/blob/master/pkg/controller/certificates/clustertrustbundlepublisher/publisher.go)
+   in kube-controller-manager, which publishes content-addressed bundles and deletes the other bundles of its signer,
+   and the [API server lease garbage collector](https://github.com/kubernetes/kubernetes/blob/master/pkg/controlplane/controller/apiserverleasegc/gc_controller.go),
+   which runs in every kube-apiserver and confirms that a lease is expired with the API server before deleting it.
+
+Consumers watch `ClusterTrustBundle` objects with a field selector on `spec.signerName`, in addition to the ConfigMap.
+For each `authentication-config-x509-*` key, they look up the referenced bundle, check its signer name and hash, and construct the authenticator from its certificates.
+A missing bundle, a mismatching signer name or hash, or not being allowed to read bundles, is a failure to construct the authenticator,
+so it is discarded along with any subsequent ones (this fails closed).
+
+Service accounts can read all `ClusterTrustBundle` objects by default (`system:cluster-trust-bundle-discovery`), which covers most extension API servers.
+Other consumers using `DelegatingAuthenticationOptions` need `list` and `watch` on `clustertrustbundles`.
+kube-controller-manager already has this (`list` and `watch` on all resources), and it is added to the `system:kube-scheduler` ClusterRole.
+
+`ClusterTrustBundle` validation requires all certificates to be CA certificates with valid basic constraints, and limits a bundle to 1 MiB,
+while Go (and thus `--client-ca-file`) does not require the CA bit for trust roots.
+To ensure that every conditional authenticator can be published, validation of the authentication configuration
+applies the same requirements to the CAs of authenticators with `userValidationRules`.
 
 ### User Stories (Optional)
 
@@ -237,6 +324,49 @@ How will UX be reviewed, and by whom?
 
 Consider including folks who also work outside the SIG or subproject.
 -->
+
+* **Conditional authenticators changing back and forth while kube-apiservers have different configuration.**
+  Since the last kube-apiserver to sync wins, extension API servers see the conditional authenticators of one kube-apiserver after the other
+  (the controller syncs at least once per minute) while the configuration is rolled out to kube-apiservers, or if it differs between them.
+  This can make a newly added CA or revocation rule apply intermittently on extension API servers, until all kube-apiservers have the same configuration.
+  kube-apiserver itself applies the configuration it has at the same time, so this is limited to the duration of the rollout.
+
+* **Consumers which do not support conditional authenticators.**
+  Extension API servers and other consumers built with an older `k8s.io/apiserver` ignore the `authentication-config-x509-*` keys and the bundles they reference.
+  A client certificate which is only verified by a conditional authenticator is rejected by them (this fails closed).
+  A CA which is removed from the configuration altogether stays in the `client-ca-file` key, and is trusted by them until it expires, as it is when removed from `--client-ca-file` today.
+  Deleting the `extension-apiserver-authentication` ConfigMap makes the controller recreate it from the current configuration.
+
+* **Published authenticators remain when the feature is disabled.**
+  kube-apiservers with the feature disabled do not modify the `authentication-config-x509-*` keys or delete the bundles they reference, so the last published ones remain
+  until a kube-apiserver with the feature enabled removes them.
+  Deleting the ConfigMap removes the keys, but the bundles remain until a kube-apiserver with the feature enabled deletes them, or they are deleted manually.
+
+* **Referenced bundles briefly unavailable to consumers.**
+  Consumers receive ConfigMap and `ClusterTrustBundle` events independently, so a consumer can see a reference to a bundle before it sees the bundle.
+  The authenticator is then discarded until the bundle arrives, rejecting client certificates which only it would verify (this fails closed).
+  Since the bundle is created before the ConfigMap is updated, this is limited to the difference in watch latency, after a change of the CAs of an authenticator.
+  Keeping the previously constructed authenticator instead was not chosen, since it would delay newly added rules, such as revocations.
+
+* **Bundles deleted while referenced, when kube-apiservers have different configuration.**
+  A kube-apiserver can delete a bundle of another kube-apiserver after confirming that it is not referenced, just before the other kube-apiserver updates the ConfigMap to reference it.
+  Consumers then discard that authenticator (this fails closed) until the other kube-apiserver recreates the bundle on its next sync, at most a minute later.
+  This is limited to kube-apiservers with different configuration, such as during a rollout.
+
+* **Consumers not allowed to read bundles.**
+  Consumers which are not allowed to list and watch `ClusterTrustBundle` objects, such as ones not running as a service account,
+  or in clusters where the default `system:cluster-trust-bundle-discovery` binding was removed, cannot construct conditional authenticators.
+  This fails closed, and the error is logged by the consumer.
+
+* **Conditional CAs readable cluster-wide.**
+  The `extension-apiserver-authentication` ConfigMap can only be read with the `extension-apiserver-authentication-reader` Role,
+  while all service accounts can read `ClusterTrustBundle` objects by default, so the CA certificates of conditional authenticators are readable more widely.
+  CA certificates are not secret, but this does reveal which CAs the cluster trusts for client authentication.
+
+* **Bundles used without their rules.**
+  Any workload can select bundles by signer name, for example in a `clusterTrustBundle` projected volume, and could trust them without the rules.
+  This is a deliberate choice of that workload, as copying the certificates from anywhere else would be;
+  the dedicated signer name keeps consumers of other signers from picking them up by accident, and its documentation states that its bundles are not to be used on their own.
 
 ## Design Details
 
@@ -813,6 +943,16 @@ What other approaches did you consider, and why did you rule them out? These do
 not need to be as detailed as the proposal, but should include enough
 information to express the idea and why it was not acceptable.
 -->
+
+Alternatives for publishing the CAs of conditional authenticators:
+
+* **Embedding the CAs in the `authentication-config-x509-*` keys of the ConfigMap.**
+  This needs no new objects or permissions, but keeps the bulkiest content in the shared ConfigMap, which is limited to 1 MiB in total, and does not benefit from the validation of `ClusterTrustBundle` objects.
+  If the ConfigMap became too large, the conditional authenticators could not be published, while deleting the ConfigMap (as done today) would not help, since they are derived from the configuration and would make it too large again.
+
+* **A mutable `ClusterTrustBundle` per authenticator name, with the ConfigMap holding the expected digest.**
+  This avoids garbage collection, but kube-apiservers with different configuration would overwrite each other's bundles,
+  and consumers would see bundles not matching the expected digest, until all kube-apiservers have the same configuration.
 
 ## Infrastructure Needed (Optional)
 
